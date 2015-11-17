@@ -129,7 +129,7 @@ function LSTMEncoder:forward(word_input, word_output, reverse)
 		loss = loss + self.criterions[self.depth]:forward(self.predictions[t], label)
 		self.output = lst
 	end
-	return self.output
+	return self.output, loss
 end
 
 -- Backpropagate. forward() must have been called previously on the same input.
@@ -144,17 +144,16 @@ function LSTMEncoder:backward(word_input, word_output, reverse)
 	end
 
 	local input_grads = torch.Tensor(word_input:size())
-	self.drnn_state = {[size] = self.initial_backward_values}	
+	local drnn_state = {[size] = self.initial_backward_values}
 	for t = size, 1, -1 do		
 		local input = reverse and word_input[size - t + 1] or word_input[t]
 		local label = reverse and word_output[size - t + 1] or word_output[t]
 		local doutput_t = self.criterions[self.depth]:backward(self.predictions[t], label)
-		table.insert(self.drnn_state[t], doutput_t)
-		local dlst = self.cells[self.depth]:backward({input, unpack(self.rnn_state[t - 1])}, self.drnn_state[t])
-		self.drnn_state[t - 1] = {}
+		local dlst = self.cells[self.depth]:backward({input, unpack(self.rnn_state[t - 1])}, utils.combine(drnn_state[t], doutput_t))
+		drnn_state[t - 1] = {}
 		for k,v in pairs(dlst) do
 			if k > 1 then
-				self.drnn_state[t-1][k-1] = v
+				drnn_state[t-1][k-1] = v
 			end
 		end
 		if reverse then
@@ -165,6 +164,7 @@ function LSTMEncoder:backward(word_input, word_output, reverse)
 		self.depth = self.depth - 1		
 	end
 	self.initial_forward_values = self.rnn_state[size] -- transfer final state to initial state (BPTT)
+	self:forget() -- important to clear out state
 	return input_grads
 end
 
@@ -184,4 +184,11 @@ end
 
 function LSTMEncoder:parameters()
 	return self.master_cell:parameters()
+end
+
+function LSTMEncoder:forget()
+	self.depth = 0
+	for i = 1, #self.initial_backward_values do
+		self.initial_backward_values[i]:zero()
+	end
 end

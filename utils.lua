@@ -117,7 +117,8 @@ function utils.loadTensorsToMemory(config)
 			break
 		end
 		local ppid, count = unpack(utils.splitByChar(line, ' '))
-		config.sentence_tensors[ppid] = {}
+		local ppSeq = config.doc2index[ppid]
+		config.sentence_tensors[ppSeq] = {}
 		for i = 1, count do
 			local sentence = fptr:read()
 			local tokens = utils.padTokens(utils.splitByChar(sentence, ' '))
@@ -132,7 +133,7 @@ function utils.loadTensorsToMemory(config)
 			if config.gpu == 1 then
 				tensor = tensor:cuda()
 			end
-			table.insert(config.sentence_tensors[ppid], tensor)
+			table.insert(config.sentence_tensors[ppSeq], {utils.createInputTarget(tensor), torch.Tensor{ppSeq}})
 		end
 		lc = lc + 1
 		if lc == 25 then
@@ -182,6 +183,16 @@ function utils.createInputTarget(tensor)
 		target_tensor[i] = tensor[i + 1]
 	end
 	return {data_tensor, target_tensor}
+end
+
+-- Function to combine table and userdata
+function utils.combine(tab, ud)
+	local resTable = {}
+	for _,data in ipairs(tab) do
+		table.insert(resTable,data)
+	end
+	table.insert(resTable, ud)
+	return resTable
 end
 
 return utils

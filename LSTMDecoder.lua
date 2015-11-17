@@ -68,12 +68,6 @@ function LSTMDecoder:new_cell()
 			local in_module = (L == 1)
 				and nn.Linear(self.in_dim, self.mem_dim)(nn.View(1, self.in_dim)(inputs[1]))
 				or  nn.Linear(self.mem_dim, self.mem_dim)(outputs[(L - 1) * 2])
-			--[[
-			return nn.CAddTable(){
-				in_module,
-				nn.Linear(self.mem_dim, self.mem_dim)(prev_h)
-			}
-			--]]
 			local old_part = nn.CAddTable(){			
 				in_module,
 				nn.Linear(self.mem_dim, self.mem_dim)(prev_h)
@@ -151,7 +145,7 @@ function LSTMDecoder:forward(inputs, word_output, reverse)
 		loss = loss + self.criterions[self.depth]:forward(self.predictions[t], label)
 		self.output = lst
 	end
-	return self.output
+	return self.output, loss
 end
 
 -- Backpropagate. forward() must have been called previously on the same input.
@@ -168,17 +162,16 @@ function LSTMDecoder:backward(inputs, word_output, reverse)
 	local doc_embed_plus_enc_state = utils.tableSelect(inputs, 2, #inputs)
 	local input_word_grads = torch.Tensor(inputs[1]:size())
 	local input_doc_grads = torch.zeros(self.doc_dim)
-	self.drnn_state = {[size] = self.initial_backward_values}	
+	local drnn_state = {[size] = self.initial_backward_values}	
 	for t = size, 1, -1 do		
 		local input = reverse and inputs[1][size - t + 1] or inputs[1][t]
 		local label = reverse and word_output[size - t + 1] or word_output[t]
 		local doutput_t = self.criterions[self.depth]:backward(self.predictions[t], label)
-		table.insert(self.drnn_state[t], doutput_t)
-		local dlst = self.cells[self.depth]:backward(self:get_decoder_input(input, self.rnn_state[t - 1], doc_embed_plus_enc_state), self.drnn_state[t])
-		self.drnn_state[t - 1] = {}
+		local dlst = self.cells[self.depth]:backward(self:get_decoder_input(input, self.rnn_state[t - 1], doc_embed_plus_enc_state), utils.combine(drnn_state[t], doutput_t))
+		drnn_state[t - 1] = {}
 		for k,v in pairs(dlst) do
 			if 2 <= k and k <= (1 + 2 * self.num_layers) then
-				self.drnn_state[t - 1][k - 1] = v
+				drnn_state[t - 1][k - 1] = v
 			end
 		end
 		-- update the word embedding input grads
@@ -200,6 +193,7 @@ function LSTMDecoder:backward(inputs, word_output, reverse)
 		-- Generate some filler grads for encoder states (since it need not be updated) 
 		table.insert(input_grad, torch.Tensor(self.mem_dim))
 	end
+	self:forget() -- important to clear out state
 	return input_grad
 end
 
@@ -231,4 +225,11 @@ function LSTMDecoder:get_decoder_input(input, rnn_state, doc_embed_plus_enc_stat
 		table.insert(resTable, state)
 	end
 	return resTable
+end
+
+function LSTMDecoder:forget()
+	self.depth = 0
+	for i = 1, #self.initial_backward_values do
+		self.initial_backward_values[i]:zero()
+	end
 end

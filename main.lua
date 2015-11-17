@@ -40,7 +40,7 @@ cmd:option('-context_size',1,'Context size')
 -- optimization
 cmd:option('-learning_rate',0.001,'learning rate')
 cmd:option('-grad_clip',5,'clip gradients at this value')
-cmd:option('-batch_size',50,'number of sequences to train on in parallel')
+cmd:option('-batch_size',5,'number of sequences to train on in parallel')
 cmd:option('-max_epochs',5,'number of full passes through the training data')
 cmd:option('-decay',0.95,'decay rate for adam')
 cmd:option('-dropout',0.5,'dropout for regularization, used after each LSTM hidden layer. 0 = no dropout')
