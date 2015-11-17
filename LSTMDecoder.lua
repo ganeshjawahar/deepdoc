@@ -1,6 +1,6 @@
 --[[
 
-Encoding document through LSTM module
+Decoding document through LSTM module
 -------------------------------------
 
 Most of this code is adapted from Stanford's TreeLSTM [1] and Char-RNN [2].
@@ -9,13 +9,14 @@ Most of this code is adapted from Stanford's TreeLSTM [1] and Char-RNN [2].
 
 --]]
 
-local LSTMEncoder, parent = torch.class('LSTMEncoder', 'nn.Module')
+local LSTMDecoder, parent = torch.class('LSTMDecoder', 'nn.Module')
 local utils = require 'utils'
 
-function LSTMEncoder:__init(config)
+function LSTMDecoder:__init(config)
 	parent.__init(self)
 	
 	self.in_dim = config.in_dim
+	self.doc_dim = config.doc_dim
 	self.mem_dim = config.mem_dim
 	self.num_layers = config.num_layers
 	self.dropout=config.dropout
@@ -39,18 +40,27 @@ end
 
 -- Instantiate a new LSTM cell.
 -- Each cell shares the same parameters, but the activations of their constituent layers differ.
-function LSTMEncoder:new_cell()
-	-- there will be 2*n+1 inputs
+function LSTMDecoder:new_cell()
+	-- there will be 1+2*n+1+n inputs
 	local inputs = {}
 	table.insert(inputs, nn.Identity()()) -- x
+
 	for L = 1, self.num_layers do
 		table.insert(inputs, nn.Identity()()) -- prev_c[L]
 		table.insert(inputs, nn.Identity()()) -- prev_h[L]
 	end
+
+	-- Document embedding
+	table.insert(inputs, nn.Identity()())
 	
+	-- Encoder final hidden state
+	for L = 1, self.num_layers do
+		table.insert(inputs, nn.Identity()())
+	end
+
 	local outputs = {}
 	for L = 1, self.num_layers do
-		-- c,h from previous timesteps
+		-- c, h from previous timesteps
 		local prev_h = inputs[L * 2 + 1]
 		local prev_c = inputs[L * 2]
 
@@ -58,10 +68,21 @@ function LSTMEncoder:new_cell()
 			local in_module = (L == 1)
 				and nn.Linear(self.in_dim, self.mem_dim)(nn.View(1, self.in_dim)(inputs[1]))
 				or  nn.Linear(self.mem_dim, self.mem_dim)(outputs[(L - 1) * 2])
+			--[[
 			return nn.CAddTable(){
 				in_module,
 				nn.Linear(self.mem_dim, self.mem_dim)(prev_h)
 			}
+			--]]
+			local old_part = nn.CAddTable(){			
+				in_module,
+				nn.Linear(self.mem_dim, self.mem_dim)(prev_h)
+			}
+			local new_part = nn.CAddTable(){			
+				nn.Linear(self.mem_dim, self.mem_dim)(inputs[self.num_layers * 2 + 2 + L]),
+				nn.Linear(self.doc_dim, self.mem_dim)(inputs[self.num_layers * 2 + 2])
+			}
+			return nn.CAddTable(){old_part, new_part}
 		end
 
 		-- decode the gates (input, forget, and output gates)
@@ -106,13 +127,14 @@ end
 -- inputs: T x in_dim tensor, where T is the number of time steps.
 -- reverse: if true, read the input from right to left (useful for bidirectional LSTMs).
 -- Returns the final hidden state of the LSTM.
-function LSTMEncoder:forward(word_input, word_output, reverse)
-	local size = word_input:size(1)
+function LSTMDecoder:forward(inputs, word_output, reverse)
+	local size = inputs[1]:size(1)
+	local doc_embed_plus_enc_state = utils.tableSelect(inputs, 2, #inputs)
 	self.predictions = {}
 	self.rnn_state = {[0] = self.initial_forward_values}
 	local loss = 0
 	for t = 1, size do
-		local input = reverse and word_input[size - t + 1] or word_input[t]
+		local input = reverse and inputs[1][size - t + 1] or inputs[1][t]
 		local label = reverse and word_output[size - t + 1] or word_output[t]
 		self.depth = self.depth + 1
 		local cell = self.cells[self.depth]
@@ -122,9 +144,9 @@ function LSTMEncoder:forward(word_input, word_output, reverse)
 			self.criterions[self.depth] = nn.ClassNLLCriterion()			
 		end
 		cell:training()
-		local lst = cell:forward({input, unpack(self.rnn_state[t - 1])})
+		local lst = cell:forward(self:get_decoder_input(input, self.rnn_state[t - 1], doc_embed_plus_enc_state))
 		self.rnn_state[t] = {}
-		for i=1, 2 * self.num_layers do table.insert(self.rnn_state[t], lst[i]) end
+		for i = 1, 2 * self.num_layers do table.insert(self.rnn_state[t], lst[i]) end
 		self.predictions[t] = lst[#lst]
 		loss = loss + self.criterions[self.depth]:forward(self.predictions[t], label)
 		self.output = lst
@@ -137,38 +159,51 @@ end
 -- grad_outputs: T x num_layers x mem_dim tensor.
 -- reverse: if true, read the input from right to left.
 -- Returns the gradients with respect to the inputs (in the same order as the inputs).
-function LSTMEncoder:backward(word_input, word_output, reverse)
-	local size = word_input:size(1)
+function LSTMDecoder:backward(inputs, word_output, reverse)
 	if self.depth == 0 then
 		error("No cells to backpropagate through")
 	end
 
-	local input_grads = torch.Tensor(word_input:size())
+	local size = inputs[1]:size(1)
+	local doc_embed_plus_enc_state = utils.tableSelect(inputs, 2, #inputs)
+	local input_word_grads = torch.Tensor(inputs[1]:size())
+	local input_doc_grads = torch.zeros(self.doc_dim)
 	self.drnn_state = {[size] = self.initial_backward_values}	
 	for t = size, 1, -1 do		
-		local input = reverse and word_input[size - t + 1] or word_input[t]
+		local input = reverse and inputs[1][size - t + 1] or inputs[1][t]
 		local label = reverse and word_output[size - t + 1] or word_output[t]
 		local doutput_t = self.criterions[self.depth]:backward(self.predictions[t], label)
 		table.insert(self.drnn_state[t], doutput_t)
-		local dlst = self.cells[self.depth]:backward({input, unpack(self.rnn_state[t - 1])}, self.drnn_state[t])
+		local dlst = self.cells[self.depth]:backward(self:get_decoder_input(input, self.rnn_state[t - 1], doc_embed_plus_enc_state), self.drnn_state[t])
 		self.drnn_state[t - 1] = {}
 		for k,v in pairs(dlst) do
-			if k > 1 then
-				self.drnn_state[t-1][k-1] = v
+			if 2 <= k and k <= (1 + 2 * self.num_layers) then
+				self.drnn_state[t - 1][k - 1] = v
 			end
 		end
+		-- update the word embedding input grads
 		if reverse then
-			input_grads[size-t+1] = dlst[1]
+			input_word_grads[size - t + 1] = dlst[1]
 		else
-			input_grads[t] = dlst[1]
+			input_word_grads[t] = dlst[1]
 		end
+		-- update the document embedding input grads
+		input_doc_grads:add(dlst[2 + 2 * self.num_layers])
 		self.depth = self.depth - 1		
 	end
 	self.initial_forward_values = self.rnn_state[size] -- transfer final state to initial state (BPTT)
-	return input_grads
+
+	local input_grad = {}
+	table.insert(input_grad, input_word_grads)
+	table.insert(input_grad, input_doc_grads)
+	for i = 1, self.num_layers do
+		-- Generate some filler grads for encoder states (since it need not be updated) 
+		table.insert(input_grad, torch.Tensor(self.mem_dim))
+	end
+	return input_grad
 end
 
-function LSTMEncoder:share(lstm, ...)
+function LSTMDecoder:share(lstm, ...)
 	if self.in_dim ~= lstm.in_dim then error("LSTM input dimension mismatch") end
 	if self.mem_dim ~= lstm.mem_dim then error("LSTM memory dimension mismatch") end
 	if self.num_layers ~= lstm.num_layers then error("LSTM layer count mismatch") end
@@ -178,10 +213,22 @@ function LSTMEncoder:share(lstm, ...)
 	utils.shareParams(self.master_cell, lstm.master_cell,...)
 end
 
-function LSTMEncoder:zeroGradParameters()
+function LSTMDecoder:zeroGradParameters()
 	self.master_cell:zeroGradParameters()
 end
 
-function LSTMEncoder:parameters()
+function LSTMDecoder:parameters()
 	return self.master_cell:parameters()
+end
+
+function LSTMDecoder:get_decoder_input(input, rnn_state, doc_embed_plus_enc_state)	
+	local resTable={}
+	table.insert(resTable, input)
+	for _,state in ipairs(rnn_state) do
+		table.insert(resTable, state)
+	end
+	for _,state in ipairs(doc_embed_plus_enc_state) do
+		table.insert(resTable, state)
+	end
+	return resTable
 end

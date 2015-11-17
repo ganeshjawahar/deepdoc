@@ -160,4 +160,28 @@ function utils.shareParams(cell, src)
 	end
 end
 
+-- select sub-range from table
+function utils.tableSelect(input, start, last)
+	if 1 <= start and last <= #input then
+		local resTable = {}
+		for i = start, last do
+			table.insert(resTable, input[i])
+		end
+		return resTable
+	else
+		error('invalid indices for selecting the table')
+	end
+end
+
+-- Function to create input and target tensor for one sentence
+function utils.createInputTarget(tensor)
+	local data_tensor = torch.Tensor(tensor:size(1) - 1)
+	local target_tensor = torch.Tensor(tensor:size(1) - 1)
+	for i = 1, tensor:size(1) - 1 do
+		data_tensor[i] = tensor[i]
+		target_tensor[i] = tensor[i + 1]
+	end
+	return {data_tensor, target_tensor}
+end
+
 return utils

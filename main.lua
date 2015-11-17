@@ -17,6 +17,7 @@ require 'cunn'
 require 'cutorch'
 include('deepdoc.lua')
 include('LSTMEncoder.lua')
+include('LSTMDecoder.lua')
 
 cmd = torch.CmdLine()
 cmd:text()
@@ -30,11 +31,12 @@ cmd:option('-pre_train_dir','data/','Directory for accesssing the pre-trained wo
 cmd:option('-to_lower',1,'change the case of word to lower case')
 -- model params (general)
 cmd:option('-wdim',100,'dimensionality of word embeddings')
-cmd:option('-ddim',100,'dimensionality of document embeddings')
+cmd:option('-ddim',200,'dimensionality of document embeddings')
 cmd:option('-min_freq',5,'words that occur less than <int> times will not be taken for training')
-cmd:option('-model','gru','LSTM variant to train (lstm, bi-lstm)')
+cmd:option('-model','lstm','LSTM variant to train (lstm, bi-lstm)')
 cmd:option('-num_layers',3,'number of layers in LSTM')
 cmd:option('-mem_dim',150,'LSTM memory dimensions')
+cmd:option('-context_size',1,'Context size')
 -- optimization
 cmd:option('-learning_rate',0.001,'learning rate')
 cmd:option('-grad_clip',5,'clip gradients at this value')
@@ -58,3 +60,4 @@ if params.print_params == 1 then
 end
 
 model=DeepDoc(params)
+model:train()
