@@ -111,6 +111,8 @@ function utils.loadTensorsToMemory(config)
 	local fptr = io.open(config.data, 'r')
 	local lc = 0
 	config.sentence_tensors = {}
+	config.training_tuples_count = 0
+	config.training_docs_count = 0
 	while true do
 		local line = fptr:read()
 		if line == nil then
@@ -130,10 +132,15 @@ function utils.loadTensorsToMemory(config)
 					tensor[j] = config.word2index[word]
 				end
 			end
+			local sent_tensor = torch.Tensor{ppSeq}
 			if config.gpu == 1 then
-				tensor = tensor:cuda()
+				sent_tensor = sent_tensor:cuda()
 			end
-			table.insert(config.sentence_tensors[ppSeq], {utils.createInputTarget(tensor), torch.Tensor{ppSeq}})
+			table.insert(config.sentence_tensors[ppSeq], {utils.createInputTarget(tensor, config), sent_tensor})
+		end
+		if #config.sentence_tensors[ppSeq] > (1 + 2 * config.context_size) then
+			config.training_tuples_count = config.training_tuples_count + (#config.sentence_tensors[ppSeq] - (2 * config.context_size))
+			config.training_docs_count = config.training_docs_count + 1
 		end
 		lc = lc + 1
 		if lc == 25 then
@@ -141,6 +148,7 @@ function utils.loadTensorsToMemory(config)
 		end
 	end
 	io.close(fptr)
+	print('No. of training tuples = '..config.training_tuples_count)
 	print(string.format('Done in %.2f minutes', ((sys.clock() - start) / 60)))
 end
 
@@ -175,12 +183,16 @@ function utils.tableSelect(input, start, last)
 end
 
 -- Function to create input and target tensor for one sentence
-function utils.createInputTarget(tensor)
+function utils.createInputTarget(tensor, config)
 	local data_tensor = torch.Tensor(tensor:size(1) - 1)
-	local target_tensor = torch.Tensor(tensor:size(1) - 1)
+	local target_tensor = torch.IntTensor(tensor:size(1) - 1, 1)
 	for i = 1, tensor:size(1) - 1 do
 		data_tensor[i] = tensor[i]
 		target_tensor[i] = tensor[i + 1]
+	end
+	if config.gpu == 1 then
+		data_tensor = data_tensor:cuda()
+		target_tensor = target_tensor:cuda()
 	end
 	return {data_tensor, target_tensor}
 end
@@ -189,10 +201,59 @@ end
 function utils.combine(tab, ud)
 	local resTable = {}
 	for _,data in ipairs(tab) do
-		table.insert(resTable,data)
+		table.insert(resTable, data)
 	end
 	table.insert(resTable, ud)
 	return resTable
+end
+
+-- Function to build frequency-based tree for Hierarchical Softmax
+function utils.create_frequency_tree(freq_map)
+	binSize=100
+	print('Creating frequency tree with '..binSize..' as bin size...')
+	local start = sys.clock()
+	local ft = torch.IntTensor(freq_map)
+	local vals, indices = ft:sort()
+	local tree = {}
+	local id = indices:size(1)
+	function recursiveTree(indices)
+		if indices:size(1) < binSize then
+			id = id + 1
+			tree[id] = indices
+			return
+		end
+		local parents = {}
+		for start = 1, indices:size(1), binSize do
+			local stop = math.min(indices:size(1), start + binSize - 1)
+			local bin = indices:narrow(1, start, stop - start + 1)
+			assert(bin:size(1) <= binSize)
+			id = id + 1
+			table.insert(parents, id)
+			tree[id] = bin
+		end
+		recursiveTree(indices.new(parents))
+	end
+	recursiveTree(indices)	
+	print(string.format('Done in %.2f minutes', ((sys.clock() - start) / 60)))
+	return tree, id
+end
+
+-- Function to create word map (for Softmaxtree)
+function utils.create_word_map(vocab,index2word)
+	word_map = {}
+	for i=1, #index2word do
+		word_map[i] = vocab[index2word[i]]
+	end
+	return word_map
+end
+
+-- Function to convert tensor to string
+function utils.convert_to_string(tensor)
+	local res = ''
+	for i = 1, tensor:size(1) do
+		res = res .. tensor[i] .. '\t'
+	end	
+	return utils.trim(res)
 end
 
 return utils

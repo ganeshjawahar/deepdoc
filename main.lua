@@ -13,8 +13,6 @@ require 'optim'
 require 'os'
 require 'xlua'
 require 'lfs'
-require 'cunn'
-require 'cutorch'
 include('deepdoc.lua')
 include('LSTMEncoder.lua')
 include('LSTMDecoder.lua')
@@ -25,10 +23,11 @@ cmd:text('DeepDoc: Learning Document Representations using Skip-Thought Vectors'
 cmd:text()
 cmd:text('Options')
 -- data
-cmd:option('-data','data/abstracts.txt','Directory for accessing the user profile prediction data.')
+cmd:option('-data','data/abstracts.txt','Document Directory.')
 cmd:option('-pre_train',1,'initialize word embeddings with pre-trained vectors?')
 cmd:option('-pre_train_dir','data/','Directory for accesssing the pre-trained word embeddings')
 cmd:option('-to_lower',1,'change the case of word to lower case')
+cmd:option('-max_test_size',10,'maximum no. of testing documents to expect')
 -- model params (general)
 cmd:option('-wdim',100,'dimensionality of word embeddings')
 cmd:option('-ddim',200,'dimensionality of document embeddings')
@@ -40,12 +39,13 @@ cmd:option('-context_size',1,'Context size')
 -- optimization
 cmd:option('-learning_rate',0.001,'learning rate')
 cmd:option('-grad_clip',5,'clip gradients at this value')
-cmd:option('-batch_size',5,'number of sequences to train on in parallel')
+cmd:option('-batch_size',10,'number of sequences to train on in parallel')
 cmd:option('-max_epochs',5,'number of full passes through the training data')
 cmd:option('-decay',0.95,'decay rate for adam')
 cmd:option('-dropout',0.5,'dropout for regularization, used after each LSTM hidden layer. 0 = no dropout')
+cmd:option('-softmaxtree',1,'use SoftmaxTree instead of the inefficient (full) softmax')
 -- GPU/CPU
-cmd:option('-gpu',0,'1=use gpu; 0=use cpu;')
+cmd:option('-gpu',1,'1=use gpu; 0=use cpu;')
 -- Book-keeping
 cmd:option('-print_params',0,'output the parameters in the console. 0=dont print; 1=print;')
 
@@ -59,5 +59,12 @@ if params.print_params == 1 then
 	end
 end
 
+-- load cuda libraries
+if params.gpu == 1 then
+	require 'cunn'
+	require 'cutorch'
+end
+
 model=DeepDoc(params)
 model:train()
+model:save_model()

@@ -21,6 +21,9 @@ function LSTMEncoder:__init(config)
 	self.dropout=config.dropout
 	self.gpu = config.gpu
 	self.vocab_size = config.vocab_size
+	self.tree = config.tree
+	self.root = config.root
+	self.softmaxtree = config.softmaxtree
 
 	self.master_cell = self:new_cell()
 	self.depth = 0
@@ -30,10 +33,17 @@ function LSTMEncoder:__init(config)
 	-- initial (t  =  0) states for forward propagation and initial error signals for backpropagation
 	self.initial_forward_values, self.initial_backward_values = {}, {}
 	for i = 1, self.num_layers do
-		table.insert(self.initial_forward_values, torch.zeros(self.mem_dim)) -- c[i]
-		table.insert(self.initial_forward_values, torch.zeros(self.mem_dim)) -- h[i]
-		table.insert(self.initial_backward_values, torch.zeros(self.mem_dim)) -- c[i]
-		table.insert(self.initial_backward_values, torch.zeros(self.mem_dim)) -- h[i]
+		if self.gpu == 1 then
+			table.insert(self.initial_forward_values, torch.zeros(self.mem_dim):cuda()) -- c[i]
+			table.insert(self.initial_forward_values, torch.zeros(self.mem_dim):cuda()) -- h[i]
+			table.insert(self.initial_backward_values, torch.zeros(self.mem_dim):cuda()) -- c[i]
+			table.insert(self.initial_backward_values, torch.zeros(self.mem_dim):cuda()) -- h[i]
+		else
+			table.insert(self.initial_forward_values, torch.zeros(self.mem_dim)) -- c[i]
+			table.insert(self.initial_forward_values, torch.zeros(self.mem_dim)) -- h[i]
+			table.insert(self.initial_backward_values, torch.zeros(self.mem_dim)) -- c[i]
+			table.insert(self.initial_backward_values, torch.zeros(self.mem_dim)) -- h[i]			
+		end
 	end
 end
 
@@ -47,6 +57,9 @@ function LSTMEncoder:new_cell()
 		table.insert(inputs, nn.Identity()()) -- prev_c[L]
 		table.insert(inputs, nn.Identity()()) -- prev_h[L]
 	end
+	if self.softmaxtree == 1 then
+		table.insert(inputs, nn.Identity()()) -- label for softmax
+	end
 	
 	local outputs = {}
 	for L = 1, self.num_layers do
@@ -55,9 +68,11 @@ function LSTMEncoder:new_cell()
 		local prev_c = inputs[L * 2]
 
 		local new_gate = function()
+			local h_l = (L == 1) and inputs[1] or outputs[(L - 1) * 2]
+			if self.dropout > 0 then h_l = nn.Dropout(self.dropout)(h_l) end
 			local in_module = (L == 1)
-				and nn.Linear(self.in_dim, self.mem_dim)(nn.View(1, self.in_dim)(inputs[1]))
-				or  nn.Linear(self.mem_dim, self.mem_dim)(outputs[(L - 1) * 2])
+				and nn.Linear(self.in_dim, self.mem_dim)(nn.View(1, self.in_dim)(h_l))
+				or  nn.Linear(self.mem_dim, self.mem_dim)(h_l)
 			return nn.CAddTable(){
 				in_module,
 				nn.Linear(self.mem_dim, self.mem_dim)(prev_h)
@@ -85,18 +100,21 @@ function LSTMEncoder:new_cell()
 	-- set up the word prediction
 	local top_h = outputs[#outputs]
 	if self.dropout > 0 then top_h = nn.Dropout(self.dropout)(top_h) end
-	local proj = nn.Linear(self.mem_dim, self.vocab_size)(top_h):annotate{name = 'decoder'}
-	local logsoft = nn.LogSoftMax()(proj)
+	local logsoft = nil
+	if self.softmaxtree == 0 then 
+		logsoft = nn.LogSoftMax()(nn.Linear(self.mem_dim, self.vocab_size)(top_h)) 
+	else 
+		logsoft = nn.SoftMaxTree(self.mem_dim, self.tree, self.root)({nn.View(1, self.mem_dim)(top_h),inputs[#inputs]})  
+	end 
 	table.insert(outputs, logsoft)
 
 	local cell = nn.gModule(inputs, outputs)
+	if self.gpu == 1 then
+		cell = cell:cuda()
+	end	
 	-- share parameters
 	if self.master_cell then
 		utils.shareParams(cell, self.master_cell)
-	end
-
-	if self.gpu == 1 then
-		cell = cell:cuda()
 	end
 
 	return cell
@@ -119,12 +137,23 @@ function LSTMEncoder:forward(word_input, word_output, reverse)
 		if cell == nil then
 			cell = self:new_cell()
 			self.cells[self.depth] = cell
-			self.criterions[self.depth] = nn.ClassNLLCriterion()			
+			if self.softmaxtree == 0 then
+				self.criterions[self.depth] = nn.ClassNLLCriterion()	
+			else
+				self.criterions[self.depth] = nn.TreeNLLCriterion()
+			end
+			if self.gpu == 1 then self.criterions[self.depth] = self.criterions[self.depth]:cuda() end
 		end
 		cell:training()
-		local lst = cell:forward({input, unpack(self.rnn_state[t - 1])})
+		local cell_input = nil
+		if self.softmaxtree == 0 then
+			cell_input = {input, unpack(self.rnn_state[t - 1])}
+		else
+			cell_input = self:get_encoder_inputs(input, self.rnn_state[t - 1], label)
+		end
+		local lst = cell:forward(cell_input)
 		self.rnn_state[t] = {}
-		for i=1, 2 * self.num_layers do table.insert(self.rnn_state[t], lst[i]) end
+		for i = 1, 2 * self.num_layers do table.insert(self.rnn_state[t], lst[i]) end
 		self.predictions[t] = lst[#lst]
 		loss = loss + self.criterions[self.depth]:forward(self.predictions[t], label)
 		self.output = lst
@@ -144,20 +173,27 @@ function LSTMEncoder:backward(word_input, word_output, reverse)
 	end
 
 	local input_grads = torch.Tensor(word_input:size())
+	if self.gpu == 1 then input_grads = input_grads:cuda() end
 	local drnn_state = {[size] = self.initial_backward_values}
 	for t = size, 1, -1 do		
 		local input = reverse and word_input[size - t + 1] or word_input[t]
 		local label = reverse and word_output[size - t + 1] or word_output[t]
 		local doutput_t = self.criterions[self.depth]:backward(self.predictions[t], label)
-		local dlst = self.cells[self.depth]:backward({input, unpack(self.rnn_state[t - 1])}, utils.combine(drnn_state[t], doutput_t))
+		local cell_input = nil
+		if self.softmaxtree == 0 then
+			cell_input = {input, unpack(self.rnn_state[t - 1])}
+		else
+			cell_input = self:get_encoder_inputs(input, self.rnn_state[t - 1], label)
+		end
+		local dlst = self.cells[self.depth]:backward(cell_input, utils.combine(drnn_state[t], doutput_t))
 		drnn_state[t - 1] = {}
 		for k,v in pairs(dlst) do
-			if k > 1 then
-				drnn_state[t-1][k-1] = v
+			if 2 <= k and k <= (1 + (2 * self.num_layers)) then
+				drnn_state[t - 1][k - 1] = v
 			end
 		end
 		if reverse then
-			input_grads[size-t+1] = dlst[1]
+			input_grads[size - t + 1] = dlst[1]
 		else
 			input_grads[t] = dlst[1]
 		end
@@ -191,4 +227,14 @@ function LSTMEncoder:forget()
 	for i = 1, #self.initial_backward_values do
 		self.initial_backward_values[i]:zero()
 	end
+end
+
+function LSTMEncoder:get_encoder_inputs(input, rnn_state, label)
+	local resTable={}
+	table.insert(resTable, input)
+	for _,state in ipairs(rnn_state) do
+		table.insert(resTable, state)
+	end
+	table.insert(resTable, label)
+	return resTable
 end
