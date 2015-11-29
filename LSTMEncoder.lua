@@ -24,6 +24,7 @@ function LSTMEncoder:__init(config)
 	self.tree = config.tree
 	self.root = config.root
 	self.softmaxtree = config.softmaxtree
+	self.max_sent_size = config.max_sent_size
 
 	self.master_cell = self:new_cell()
 	self.depth = 0
@@ -44,6 +45,18 @@ function LSTMEncoder:__init(config)
 			table.insert(self.initial_backward_values, torch.zeros(self.mem_dim)) -- c[i]
 			table.insert(self.initial_backward_values, torch.zeros(self.mem_dim)) -- h[i]			
 		end
+	end
+
+	-- initialize all the clones
+	for i = 1, self.max_sent_size do
+		local cell = self:new_cell()
+		self.cells[i] = cell
+		if self.softmaxtree == 0 then
+			self.criterions[i] = nn.ClassNLLCriterion()	
+		else
+			self.criterions[i] = nn.TreeNLLCriterion()
+		end
+		if self.gpu == 1 then self.criterions[i] = self.criterions[i]:cuda() end		
 	end
 end
 
@@ -134,16 +147,6 @@ function LSTMEncoder:forward(word_input, word_output, reverse)
 		local label = reverse and word_output[size - t + 1] or word_output[t]
 		self.depth = self.depth + 1
 		local cell = self.cells[self.depth]
-		if cell == nil then
-			cell = self:new_cell()
-			self.cells[self.depth] = cell
-			if self.softmaxtree == 0 then
-				self.criterions[self.depth] = nn.ClassNLLCriterion()	
-			else
-				self.criterions[self.depth] = nn.TreeNLLCriterion()
-			end
-			if self.gpu == 1 then self.criterions[self.depth] = self.criterions[self.depth]:cuda() end
-		end
 		cell:training()
 		local cell_input = nil
 		if self.softmaxtree == 0 then

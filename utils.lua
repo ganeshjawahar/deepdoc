@@ -41,6 +41,39 @@ function utils.splitByChar(str, inSplitPattern)
 	return outResults
 end
 
+-- Function to build document vocab
+function utils.buildDoc(config)
+	local fptr = io.open(config.data, 'r')
+	config.index2doc = {}
+	config.doc2index = {}
+	config.training_tuples_count = 0
+	while true do
+		local line = fptr:read()
+		if line == nil then
+			break
+		end
+		local ppid, count = unpack(utils.splitByChar(line, '\t'))		
+		count = tonumber(count)
+		local is_valid_doc = true
+		for i = 1, count do
+			local sentence = fptr:read()
+			local words = utils.padTokens(utils.splitByChar(sentence, ' '))
+			if #words > config.max_sent_size then
+				is_valid_doc = false
+			end
+		end		
+		if count > (1 + 2 * config.context_size) and is_valid_doc == true then
+			config.index2doc[#config.index2doc + 1] = ppid
+			config.doc2index[ppid] = #config.index2doc			
+			config.training_tuples_count = config.training_tuples_count + (count - (2 * config.context_size))
+		end	
+		if #config.index2doc == 100000 then
+			break
+		end
+	end
+	io.close(fptr)	
+end
+
 -- Function to build vocabulary from the corpus
 function utils.buildVocab(config)
 	print('Building vocabulary...')
@@ -48,39 +81,39 @@ function utils.buildVocab(config)
 	config.vocab = {} -- word frequency map
 	config.index2word = {}
 	config.word2index = {}
-	config.index2doc = {}
-	config.doc2index = {}
+	utils.buildDoc(config)
 
 	config.word_count = 0
 	local fptr = io.open(config.data, 'r')
-	local i = 0
+	config.max_sent_size = 0
 	while true do
 		local line = fptr:read()
 		if line == nil then
 			break
 		end
-		local ppid, count = unpack(utils.splitByChar(line, ' '))
-		config.index2doc[#config.index2doc + 1] = ppid
-		config.doc2index[ppid] = #config.index2doc
+		local ppid, count = unpack(utils.splitByChar(line, '\t'))
+		local local_max = 0
 		for i = 1, count do
 			local sentence = fptr:read()
-			for _, word in ipairs(utils.padTokens(utils.splitByChar(sentence, ' '))) do
-				if config.to_lower == 1 then
-					word = word:lower()
-				end
+			if config.doc2index[ppid] ~= nil then
+				local tokens = utils.padTokens(utils.splitByChar(sentence, ' '))
+				for _, word in ipairs(tokens) do
+					if config.to_lower == 1 then
+						word = word:lower()
+					end
 
-				-- Fill word vocab.
-				if config.vocab[word] == nil then
-					config.vocab[word] = 1
-				else
-					config.vocab[word] = config.vocab[word] + 1
+					-- Fill word vocab.
+					if config.vocab[word] == nil then
+						config.vocab[word] = 1
+					else
+						config.vocab[word] = config.vocab[word] + 1
+					end
+					config.word_count = config.word_count+1
 				end
-				config.word_count = config.word_count+1
-			end
-		end
-		i = i + 1
-		if i == 25 then
-			break
+				if #tokens > config.max_sent_size then
+					config.max_sent_size = #tokens
+				end
+			end			
 		end
 	end
 	io.close(fptr)	
@@ -102,6 +135,8 @@ function utils.buildVocab(config)
 
 	print(string.format("%d words, %d documents processed in %.2f minutes.", config.word_count, #config.index2doc, ((sys.clock() - start) / 60)))
 	print(string.format("Vocab size after eliminating words occuring less than %d times: %d", config.min_freq, #config.index2word))
+	print('No. of training tuples = '..config.training_tuples_count)
+	print('Global Max. Sent Size = '..config.max_sent_size..' (including pads)')
 end
 
 -- Function to load sentence tensors to memory
@@ -109,46 +144,90 @@ function utils.loadTensorsToMemory(config)
 	print('Loading sentence tensors...')
 	local start = sys.clock()
 	local fptr = io.open(config.data, 'r')
-	local lc = 0
 	config.sentence_tensors = {}
-	config.training_tuples_count = 0
-	config.training_docs_count = 0
+	xlua.progress(1, #config.index2doc)
+	local train_count = 0
+	local count = 0
+	local lc = 0
 	while true do
 		local line = fptr:read()
 		if line == nil then
 			break
 		end
-		local ppid, count = unpack(utils.splitByChar(line, ' '))
-		local ppSeq = config.doc2index[ppid]
-		config.sentence_tensors[ppSeq] = {}
+		local ppid, count = unpack(utils.splitByChar(line, '\t'))
+		local tensors = {}
 		for i = 1, count do
 			local sentence = fptr:read()
-			local tokens = utils.padTokens(utils.splitByChar(sentence, ' '))
-			local tensor = torch.Tensor(#tokens)
-			for j, word in ipairs(tokens) do
-				if config.word2index[word] == nil then
-					tensor[j] = config.word2index['<UK>']
-				else
-					tensor[j] = config.word2index[word]
+			if config.doc2index[ppid] ~= nil then
+				local tokens = utils.padTokens(utils.splitByChar(sentence, ' '))
+				local tensor = torch.Tensor(#tokens)
+				for j, word in ipairs(tokens) do
+					if config.word2index[word] == nil then
+						tensor[j] = config.word2index['<UK>']
+					else
+						tensor[j] = config.word2index[word]
+					end
 				end
+				local sent_tensor = torch.Tensor{config.doc2index[ppid]}
+				if config.gpu == 1 then
+					sent_tensor = sent_tensor:cuda()
+				end
+				table.insert(tensors, {utils.createInputTarget(tensor, config), sent_tensor})
 			end
-			local sent_tensor = torch.Tensor{ppSeq}
-			if config.gpu == 1 then
-				sent_tensor = sent_tensor:cuda()
-			end
-			table.insert(config.sentence_tensors[ppSeq], {utils.createInputTarget(tensor, config), sent_tensor})
+		end		
+		if config.doc2index[ppid] ~= nil then
+			train_count = train_count + 1
+			config.sentence_tensors[config.doc2index[ppid]] = tensors
+			lc = lc + 1
+		else
+			tensors = nil
 		end
-		if #config.sentence_tensors[ppSeq] > (1 + 2 * config.context_size) then
-			config.training_tuples_count = config.training_tuples_count + (#config.sentence_tensors[ppSeq] - (2 * config.context_size))
-			config.training_docs_count = config.training_docs_count + 1
+		if train_count % 100 == 0 then
+			xlua.progress(train_count, #config.index2doc)
+			collectgarbage()
 		end
-		lc = lc + 1
-		if lc == 25 then
+		if lc == 100000 then
 			break
 		end
 	end
+	xlua.progress(#config.index2doc, #config.index2doc)
 	io.close(fptr)
-	print('No. of training tuples = '..config.training_tuples_count)
+	print(string.format('Done in %.2f minutes', ((sys.clock() - start) / 60)))
+end
+
+-- Function to load dataset into CPU RAM.
+function utils.loadStringsToMemory(config)
+	print('Loading sentence strings ...')
+	local start = sys.clock()
+	local fptr = io.open(config.data, 'r')
+	config.sentence_strings = {}
+	xlua.progress(1, #config.index2doc)
+	local train_count = 0
+	while true do
+		local line = fptr:read()
+		if line == nil then
+			break
+		end
+		local ppid, count = unpack(utils.splitByChar(line, '\t'))
+		local strings = {}
+		local ppSeq = config.doc2index[ppid]
+		for i = 1, count do
+			local sentence = fptr:read()
+			table.insert(strings, sentence)
+		end
+		if config.doc2index[ppid] ~= nil then
+			train_count = train_count + 1
+			config.sentence_strings[config.doc2index[ppid]] = strings
+		else
+			strings = nil
+		end
+		if train_count % 100 == 0 then
+			xlua.progress(train_count, #config.index2doc)
+			collectgarbage()
+		end
+	end
+	xlua.progress(#config.index2doc, #config.index2doc)
+	io.close(fptr)
 	print(string.format('Done in %.2f minutes', ((sys.clock() - start) / 60)))
 end
 
@@ -234,7 +313,6 @@ function utils.create_frequency_tree(freq_map)
 		recursiveTree(indices.new(parents))
 	end
 	recursiveTree(indices)	
-	print(string.format('Done in %.2f minutes', ((sys.clock() - start) / 60)))
 	return tree, id
 end
 
@@ -254,6 +332,112 @@ function utils.convert_to_string(tensor)
 		res = res .. tensor[i] .. '\t'
 	end	
 	return utils.trim(res)
+end
+
+-- Function to create input batches
+function utils.createBatches(config)
+	print('Creating batches for lazy-loading...')
+	local start = sys.clock()
+	local fptr = io.open(config.data, 'r')
+	config.rootDir = 'batches/'
+	local maxTuplesPerFile, proc_tup_count = 50000, 0
+	config.seqNo = 1
+	local dataset_batches, dataset = {}, {}
+	if path.exists(config.rootDir) then lfs.rmdir(config.rootDir) end
+	lfs.mkdir(config.rootDir)
+	xlua.progress(1, config.training_tuples_count)
+	while true do
+		local line = fptr:read()
+		if line == nil then
+			break
+		end
+		local ppid, count = unpack(utils.splitByChar(line, '\t'))
+		local sent_tensors = {}
+		for i = 1, count do
+			local sentence = fptr:read()
+			if config.doc2index[ppid] ~= nil then
+				local tokens = utils.padTokens(utils.splitByChar(sentence, ' '))
+				local tensor = torch.Tensor(#tokens)
+				for j, word in ipairs(tokens) do
+					if config.word2index[word] == nil then
+						tensor[j] = config.word2index['<UK>']
+					else
+						tensor[j] = config.word2index[word]
+					end
+				end
+				local sent_tensor = torch.Tensor{config.doc2index[ppid]}
+				if config.gpu == 1 then
+					sent_tensor = sent_tensor:cuda()
+				end
+				table.insert(sent_tensors, {utils.createInputTarget(tensor, config), sent_tensor})
+			end
+		end
+		if config.doc2index[ppid] ~= nil then
+			for j = (1 + config.context_size), (#sent_tensors - config.context_size) do
+				local input = {}
+				table.insert(input, sent_tensors[j])
+				for k = (j - config.context_size), (j + config.context_size) do
+					if k ~= j then
+						table.insert(input, sent_tensors[k])
+					end
+				end
+				table.insert(dataset, input)
+				if #dataset == config.batch_size then
+					table.insert(dataset_batches, dataset)
+					dataset = nil
+					dataset = {}
+				end
+				if proc_tup_count % maxTuplesPerFile == 0 then
+					torch.save(config.rootDir..'b_'..config.seqNo..'.t7', dataset_batches)
+					dataset_batches = nil
+					dataset_batches = {}
+					collectgarbage()
+					config.seqNo = config.seqNo + 1
+				end
+				proc_tup_count = proc_tup_count + 1
+				if proc_tup_count % 300 == 0 then
+					xlua.progress(proc_tup_count, config.training_tuples_count)
+				end
+			end
+		else
+			sent_tensors = nil
+		end
+	end
+	if #dataset ~= 0 then
+		table.insert(dataset_batches, dataset)
+		torch.save(config.rootDir..'b_'..config.seqNo..'.t7', dataset_batches)
+		dataset = nil
+		dataset = {}
+		dataset_batches = nil
+		dataset_batches = {}
+		collectgarbage()
+		config.seqNo = config.seqNo + 1
+	end
+	config.seqNo = config.seqNo - 1
+	xlua.progress(config.training_tuples_count, config.training_tuples_count)
+	io.close(fptr)
+	print(string.format('Done in %.2f minutes', ((sys.clock() - start) / 60)))
+end
+
+-- Function to initalize word weights
+function utils.initWordWeights(config)
+	print('initializing the pre-trained embeddings...')
+	local start=sys.clock()
+	local ic=0
+	for line in io.lines(config.pre_train_file) do
+		local content=utils.splitByChar(line,' ')
+		local word=content[1]
+		if config.word2index[word]~=nil then
+			local tensor=torch.Tensor(#content-1)
+			for i=2,#content do
+				tensor[i-1]=tonumber(content[i])
+			end
+			config.word_vecs.weight[config.word2index[word]]=tensor
+			ic=ic+1
+		end
+	end
+	print(string.format("%d out of %d words initialized.",ic,#config.index2word))
+	print(string.format("Done in %.2f seconds.",sys.clock()-start))
 end
 
 return utils
